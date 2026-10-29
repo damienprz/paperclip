@@ -209,8 +209,10 @@ export const createAiConnectionSchema = z
       ctx.addIssue({ code: "custom", message: "Routing requires the matching provider and API authentication." });
     if (v.routing && ["gateway", "local"].includes(v.routing.kind) && v.provider !== (v.routing.protocol === "messages" ? "anthropic" : "openai"))
       ctx.addIssue({ code: "custom", message: "The provider must match the endpoint’s API format." });
-    if (v.routing?.auth === "none") {
-      if (v.apiKey || v.loginSessionId) ctx.addIssue({ code: "custom", message: "Provide only the selected authentication method." });
+    if (v.routing?.auth === "none" || v.routing?.kind === "local" || v.routing?.kind === "gateway") {
+      if (v.routing?.auth === "none" && (v.apiKey || v.loginSessionId)) {
+        ctx.addIssue({ code: "custom", message: "Provide only the selected authentication method." });
+      }
       return;
     }
     if (

@@ -54,22 +54,17 @@ export const aiProviderRoutingSchema = z
     if (route.kind === "gateway" || route.kind === "local") {
       try {
         const url = new URL(route.baseUrl ?? "");
-        const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(
-          url.hostname,
-        );
         if (
           url.username ||
           url.password ||
           url.search ||
           url.hash ||
-          (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
+          (url.protocol !== "https:" && url.protocol !== "http:")
         )
           throw new Error();
-        if (route.kind === "local" && !loopback)
-          invalid("A local endpoint must use localhost or a loopback address.");
       } catch {
         invalid(
-          "Enter an HTTPS base URL without credentials, query parameters, or a fragment. Local endpoints may use HTTP.",
+          "Enter an HTTP or HTTPS base URL without credentials, query parameters, or a fragment.",
         );
       }
     }
