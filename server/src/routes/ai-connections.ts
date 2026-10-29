@@ -313,6 +313,7 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
         if (!input.apiKey?.startsWith("github_pat_")) throw unprocessable("Use a personal fine-grained token with Copilot Requests permission.", { code: "COPILOT_AUTH_REQUIRED" });
         await probeCopilotConnection(db, companyId, input.apiKey, input.environmentId, undefined, { pluginWorkerManager: options.pluginWorkerManager });
       } else if (!input.routing || input.routing.kind === "openrouter") await validateAiApiKey(input.provider, input.apiKey!);
+      else if (input.routing && input.routing.kind !== "local" && input.routing.kind !== "gateway") await validateAiApiKey(input.provider, input.apiKey!);
       const result = await service.save(
         companyId,
         userId,

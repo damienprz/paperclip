@@ -31,6 +31,7 @@ import {
   ADAPTER_AUTH_MISSING_CHECK_CODE,
   aiConnectionBindingSchema,
   aiConnectionMetadataSchema,
+  aiRoutingBaseUrl,
   aiRoutingModel,
   aiRuntimeConnectionBindingSchema,
   type AiConnectionBinding,
@@ -3097,6 +3098,33 @@ export function agentRoutes(
     if (type === "opencode_local" && provider === "openrouter") {
       res.json(await listOpenRouterModels(refresh));
       return;
+    }
+
+    let aiConnectionBinding: AiConnectionBinding | undefined;
+    if (typeof req.query.aiConnection === "string") {
+      try { aiConnectionBinding = aiConnectionBindingSchema.parse(JSON.parse(req.query.aiConnection)); }
+      catch { /* Ignore parsing errors */ }
+    }
+
+    if (aiConnectionBinding && "routing" in aiConnectionBinding && aiConnectionBinding.routing && (aiConnectionBinding.routing.kind === "local" || aiConnectionBinding.routing.kind === "gateway")) {
+      const baseUrl = aiRoutingBaseUrl(aiConnectionBinding.routing, type);
+      if (baseUrl) {
+        try {
+          const response = await fetch(`${baseUrl}/models`, { signal: AbortSignal.timeout(10_000) });
+          if (response.ok) {
+            const body = await response.json() as { data?: Array<{ id?: unknown; name?: unknown }> };
+            if (Array.isArray(body.data)) {
+              const models = body.data.flatMap(model => typeof model.id === "string"
+                ? [{ id: model.id, label: typeof model.name === "string" ? model.name : model.id }]
+                : []);
+              res.json(models);
+              return;
+            }
+          }
+        } catch {
+          // Fall through to adapter refresh if dynamic discovery fails
+        }
+      }
     }
     if (type === "paperclip_runner" && provider && !isPaperclipRunnerProvider(provider)) {
       throw unprocessable("Unknown Paperclip Runner provider");
