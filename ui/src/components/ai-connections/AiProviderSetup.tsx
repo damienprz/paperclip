@@ -327,6 +327,11 @@ export function AiProviderSetup({
         >
           {(provider === "gateway" || provider === "local") && (
             <>
+              {(provider === "local" || provider === "gateway") && (
+                <div className="bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-900 p-3 rounded-md text-sm text-amber-800 dark:text-amber-200">
+                  <span className="font-semibold">Warning:</span> Ensure your local model is configured with a minimum context window of 16,384 tokens. Smaller context windows will cause silent truncation of the system prompt and lead to agent hallucinations.
+                </div>
+              )}
               <label className="block space-y-2 text-xs text-muted-foreground">
                 Provider URL
                 <Input
@@ -453,7 +458,7 @@ export function AiProviderSetup({
               disabled={
                 save.isPending || accounts.isPending || accounts.isError ||
                 (!reconnect && ownership === "shared" && !allAgents && agentIds.size === 0) ||
-                (auth !== "none" && !apiKey.trim())
+                (auth !== "none" && provider !== "local" && provider !== "gateway" && !apiKey.trim())
               }
             >
               {save.isPending
