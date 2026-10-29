@@ -3107,7 +3107,14 @@ export function agentRoutes(
     }
 
     if (aiConnectionBinding && "routing" in aiConnectionBinding && aiConnectionBinding.routing && (aiConnectionBinding.routing.kind === "local" || aiConnectionBinding.routing.kind === "gateway")) {
-      const baseUrl = aiRoutingBaseUrl(aiConnectionBinding.routing, type);
+      const routing = {
+        kind: aiConnectionBinding.routing.kind,
+        protocol: aiConnectionBinding.routing.protocol ?? "chat",
+        auth: aiConnectionBinding.routing.auth ?? "none",
+        baseUrl: aiConnectionBinding.routing.baseUrl,
+        models: aiConnectionBinding.routing.models ?? [],
+      } as const;
+      const baseUrl = aiRoutingBaseUrl(routing, type);
       if (baseUrl) {
         try {
           const response = await fetch(`${baseUrl}/models`, { signal: AbortSignal.timeout(10_000) });
