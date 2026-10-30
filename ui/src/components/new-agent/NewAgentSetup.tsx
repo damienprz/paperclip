@@ -156,6 +156,7 @@ function Setup({
   const showModel = !isDot && !["cursor_cloud", "hermes_gateway"].includes(adapterType);
   const [allowUnmeteredProvider, setAllowUnmeteredProvider] = useState(false);
   const [gatewayUrl, setGatewayUrl] = useState("");
+  const [gatewayBaseUrl, setGatewayBaseUrl] = useState("");
   const [kimiModel, setKimiModel] = useState("");
   const [kimiBaseUrl, setKimiBaseUrl] = useState("");
   const [kimiProtocol, setKimiProtocol] = useState("kimi");
@@ -350,7 +351,9 @@ function Setup({
     environment?.driver === "sandbox" &&
     caps.data?.sandboxProviders?.[sandboxProvider]?.supportsLoginPty === true;
   const envKey =
-    SETUP_CREDENTIAL_KEYS[adapterType] ?? providerKeys[provider] ?? "API_KEY";
+    provider === "gateway"
+      ? "PAPERCLIP_AI_PROVIDER_KEY"
+      : SETUP_CREDENTIAL_KEYS[adapterType] ?? providerKeys[provider] ?? "API_KEY";
   const savedKey = userSecrets.data?.find(
     (entry) => entry.definition.key === envKey && entry.secret,
   );
@@ -487,6 +490,12 @@ function Setup({
         ...(branch.trim() ? { repoStartingRef: branch.trim() } : {}),
       });
     if (adapterType === "hermes_gateway") config.apiBaseUrl = gatewayUrl.trim();
+    if (provider === "gateway" && gatewayBaseUrl.trim()) {
+      config.env = {
+        ...((config.env as object) ?? {}),
+        PAPERCLIP_AI_PROVIDER_URL: { type: "plain", value: gatewayBaseUrl.trim() },
+      };
+    }
     if (usingKimiApi) {
       // --model overrides Kimi's environment-defined model. Let KIMI_MODEL_NAME win.
       delete config.model;
@@ -533,12 +542,27 @@ function Setup({
         throw new Error("Enter the Hermes API base URL.");
       }
     }
+    if (provider === "gateway") {
+      if (!gatewayBaseUrl.trim()) {
+        throw new Error("Enter the custom gateway base URL.");
+      }
+      try {
+        new URL(gatewayBaseUrl.trim());
+      } catch {
+        throw new Error("Enter a valid custom gateway URL.");
+      }
+    }
     if (usingKimiApi && !kimiModel.trim())
       throw new Error("Enter the Kimi API model name.");
     return buildConfig(nextConnection, selectedBinding, setupRunner);
   }
   function pendingCredentials(nextConnection = connection) {
-    if (aiBinding || nextConnection?.aiConnection) return {};
+    if (aiBinding || nextConnection?.aiConnection) {
+      if (provider === "gateway" && apiKey.trim()) {
+        return { [envKey]: apiKey.trim() };
+      }
+      return {};
+    }
     return {
       ...nextConnection?.credentials,
       ...(hasCredentialField && apiKey.trim()
@@ -1108,6 +1132,7 @@ function Setup({
                                   const nextProvider = value.split("/")[0];
                                   if (
                                     multiProvider &&
+                                    provider !== "gateway" &&
                                     PROVIDER_ENV_KEYS[nextProvider] &&
                                     nextProvider !== provider
                                   ) {
@@ -1186,6 +1211,9 @@ function Setup({
                                               }[key] ?? key)}
                                     </option>
                                   ))}
+                                  <option key="gateway" value="gateway">
+                                    Custom gateway
+                                  </option>
                                 </select>
                               </Field>
                             )}
@@ -1279,6 +1307,19 @@ function Setup({
                                 resetTest();
                               }}
                               placeholder="https://hermes.example.com"
+                            />
+                          </Field>
+                        )}
+                        {provider === "gateway" && (
+                          <Field label="Custom gateway URL">
+                            <Input
+                              aria-label="Custom gateway URL"
+                              value={gatewayBaseUrl}
+                              onChange={(event) => {
+                                setGatewayBaseUrl(event.target.value);
+                                resetTest();
+                              }}
+                              placeholder="https://integrate.api.nvidia.com/v1"
                             />
                           </Field>
                         )}
