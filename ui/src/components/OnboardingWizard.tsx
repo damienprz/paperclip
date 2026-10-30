@@ -1,4 +1,3 @@
-import { COPILOT_MODEL_DISCOVERY_QUERY_OPTIONS } from "@/lib/copilot-task-model-catalog";
 import type { AgentRunner, AgentRunnerChoice } from "@paperclipai/shared";
 import { needsClaudeSetupQualification, qualifyClaudeSetup } from "../lib/qualify-claude-setup";
 import { agentHarnessType } from "@paperclipai/shared";
@@ -8,10 +7,8 @@ import { healthApi } from "@/api/health";
 import { LocalProviderLoginInstructions } from "./AdapterLoginChrome";
 import { useLocalAiLogin } from "./ai-connections/useLocalAiLogin";
 import { aiConnectionsApi } from "@/api/ai-connections";
-import { AiConnectionField, aiProviderForAdapter } from "./ai-connections/AiConnectionField";
+import { aiProviderForAdapter } from "./ai-connections/AiConnectionField";
 import { useConnectionModelsState } from "./ai-connections/useConnectionModels";
-import { PAPERCLIP_RUNNER_ACPX_PROFILES } from "@paperclipai/adapter-utils";
-import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import type { AiConnectionBinding } from "@paperclipai/shared";
 import { storeProviderApiKey } from "../lib/provider-credential";
 import { SavedProviderKeySelect, useSavedProviderKeys } from "./onboarding/SavedProviderKeySelect";
@@ -26,10 +23,12 @@ import type {
   AdapterEnvironmentTestResult,
   Agent,
   AgentRole,
+  AiProviderRouting,
   ClaudeOAuthTokenStatusResponse,
   Environment,
   InstanceSettings,
 } from "@paperclipai/shared";
+import { aiProviderRoutingSchema } from "@paperclipai/shared";
 import { AGENT_ROLES, AGENT_ROLE_LABELS, ADAPTER_AUTH_MISSING_CHECK_CODE } from "@paperclipai/shared";
 import { AdapterLoginPanel, ModelDropdown } from "./AgentConfigForm";
 import {
@@ -151,6 +150,7 @@ import {
   Check,
   Loader2,
   ChevronDown,
+  Monitor,
 } from "lucide-react";
 
 type Step = 0 | 1 | 2 | 3 | 4 | 5;
@@ -158,23 +158,13 @@ type Step = 0 | 1 | 2 | 3 | 4 | 5;
 // wizard's registry-driven approach rather than a fixed union.
 type AdapterType = string;
 
-// Only the qualified Copilot profile is offered through Runner in onboarding.
-// Other Runner profiles remain explicit agent configuration choices.
-const ONBOARDING_EXCLUDED_ADAPTER_TYPES = new Set([
-  "process",
-  "http",
-  "paperclip_runner",
-]);
-
-const copilotOnboardingQualified = PAPERCLIP_RUNNER_ACPX_PROFILES.some(
-  (profile) => profile.value === "copilot" && profile.qualified,
-);
+const ONBOARDING_ADAPTER_TYPES = new Set(["claude_local", "codex_local"]);
 
 function restoreOnboardingAdapterType(savedAdapterType: unknown, provider?: unknown, savedCopilot?: unknown): AdapterType {
   if (savedAdapterType === "paperclip_runner" && provider === "pi") return "pi_local";
   if (savedAdapterType === "paperclip_runner" && provider === "opencode") return "opencode_local";
   if (savedAdapterType === "paperclip_runner" && savedCopilot !== true && (provider === undefined || provider === "codex")) return "codex_local";
-  return typeof savedAdapterType === "string" && (savedAdapterType !== "paperclip_runner" || (savedCopilot === true && copilotOnboardingQualified))
+  return typeof savedAdapterType === "string" && savedAdapterType !== "paperclip_runner"
     ? savedAdapterType
     : "claude_local";
 }
@@ -268,12 +258,26 @@ const MODEL_SOURCE_INLINE_MARKS: Record<string, ComponentType<{ className?: stri
 const API_KEY_ENV_KEYS: Record<string, string> = {
   claude_local: ANTHROPIC_API_KEY_ENV_KEY,
   codex_local: "OPENAI_API_KEY",
-  paperclip_runner: "COPILOT_GITHUB_TOKEN",
 };
 
 function apiKeyEnvKeyFor(adapterType: string): string {
   return API_KEY_ENV_KEYS[adapterType] ?? "API_KEY";
 }
+
+/**
+ * The connect step's third source: the customer's own model server, an
+ * OpenAI-compatible endpoint on this machine or the private network it runs
+ * on. It is not an adapter type and is not restored from a draft: picking it
+ * is an answer to the step's question, exactly like picking a tile, and the
+ * card that answers it asks for the endpoint, the model, and the key.
+ *
+ * The hire it leads to runs on the OpenCode harness: the endpoint is stored
+ * as a personal AI connection of the `local` kind, and the harness the
+ * connection routes to is OpenCode (or Hermes, had the step offered it), which
+ * is the chat-completions harness the routing contract names.
+ */
+const LOCAL_LLM_SOURCE_ID = "local_llm";
+const LOCAL_LLM_HARNESS = "opencode_local";
 
 function ModelSourceMark({
   type,
@@ -611,10 +615,11 @@ function OnboardingWizardInner({
     // one.
     (saved?.agentRole as AgentRole) || DEFAULT_AGENT_ROLE,
   );
+  const savedCopilotDraft = saved?.adapterType === "paperclip_runner" && saved?.onboardingCopilot === true;
   const [adapterType, setAdapterType] = useState<AdapterType>(() =>
     restoreOnboardingAdapterType(saved?.adapterType, saved?.runnerProvider, saved?.onboardingCopilot),
   );
-  const [runner, setRunner] = useState<AgentRunnerChoice>(() => saved?.runner === "legacy" || saved?.runner === "paperclip"
+  const [runner, setRunner] = useState<AgentRunnerChoice>(() => savedCopilotDraft ? "auto" : saved?.runner === "legacy" || saved?.runner === "paperclip"
     ? saved.runner : saved?.adapterType === "paperclip_runner" && (saved?.runnerProvider === undefined || ["codex", "claude", "acpx", "opencode", "pi"].includes(String(saved?.runnerProvider))) ? "paperclip" : "auto");
   /**
    * Whether a model source has been chosen, as opposed to which one
@@ -640,15 +645,13 @@ function OnboardingWizardInner({
    */
   const [sourcePicked, setSourcePicked] = useState(false);
   const [setupNameConflict, setSetupNameConflict] = useState<string | null>(null);
-  const isCopilot = adapterType === "paperclip_runner";
-  const [copilotConnection, setCopilotConnection] = useState<AiConnectionBinding>();
   const [gatewayConnection, setGatewayConnection] = useState<{
     companyId: string; adapterType: string; binding: AiConnectionBinding;
   }>();
-  const savedNativeRunnerDraft = saved?.adapterType === "paperclip_runner" && !(saved?.onboardingCopilot === true && copilotOnboardingQualified);
+  const savedNativeRunnerDraft = saved?.adapterType === "paperclip_runner" && !savedCopilotDraft;
   const [cwd, setCwd] = useState((saved?.cwd as string) ?? "");
   const [model, setModel] = useState(
-    savedNativeRunnerDraft && saved?.runnerProvider !== undefined && !["codex", "claude", "acpx", "opencode", "pi"].includes(String(saved.runnerProvider)) ? "" : (saved?.model as string) ?? "",
+    savedCopilotDraft || (savedNativeRunnerDraft && saved?.runnerProvider !== undefined && !["codex", "claude", "acpx", "opencode", "pi"].includes(String(saved.runnerProvider))) ? "" : (saved?.model as string) ?? "",
   );
   const [command, setCommand] = useState(
     saved?.adapterType === "paperclip_runner" ? "" : (saved?.command as string) ?? "",
@@ -707,6 +710,21 @@ function OnboardingWizardInner({
    * `localStorage`, and a provider key does not belong there.
    */
   const [apiKey, setApiKey] = useState("");
+  // The local-LLM answer to the step: the source was picked, and what the
+  // card collects for it. The key reuses the step's one field — it is the
+  // credential either way — while the endpoint and the model are this
+  // source's own.
+  const [localLlmSource, setLocalLlmSource] = useState(false);
+  const [localLlmKind, setLocalLlmKind] = useState<"local" | "gateway">("local");
+  const [localLlmBaseUrl, setLocalLlmBaseUrl] = useState("");
+  const [localLlmModel, setLocalLlmModel] = useState("");
+  /**
+   * The connection a picked endpoint was stored as, remembered for its
+   * company. Connect can be pressed more than once — a hire that fails leaves
+   * the customer on the step to try again — and without this each press would
+   * store another copy of the same endpoint and key.
+   */
+  const localLlmConnectionRef = useRef<{ companyId: string; connectionId: string; grantId: string } | null>(null);
   // The owner's stored Claude subscription login, read right before the hire
   // (see handleGiveHeartbeat). Onboarding applies it with no extra control,
   // so nothing else reads this state yet.
@@ -731,7 +749,7 @@ function OnboardingWizardInner({
     ? selectedSavedKey.id
     : savedKeys.options[0]?.id;
   const selectedApiKey = savedKeys.options.find((option) => option.id === selectedApiKeyId);
-  const credentialMode = isCopilot ? "api" : credentialModeChoice ?? (
+  const credentialMode = credentialModeChoice ?? (
     (savedKeys.subscriptions.length > 0 || (adapterType === "claude_local" && savedKeys.storedLogin.data))
       ? "subscription" : savedKeys.options.length || adapterType === "opencode_local" ? "api" : "subscription"
   );
@@ -791,10 +809,9 @@ function OnboardingWizardInner({
    */
   const apiKeySecretRef = useRef<{ key: string; companyId: string; envKey: string; binding?: Awaited<ReturnType<typeof storeProviderApiKey>>["binding"]; aiConnection?: AiConnectionBinding } | null>(null);
   const managedSubscriptionRef = useRef<{ companyId: string; binding: AiConnectionBinding } | null>(null);
-  const managedProvider = aiProviderForAdapter(isCopilot ? "copilot_runtime" : adapterType);
+  const managedProvider = aiProviderForAdapter(adapterType);
   const managedSubscriptionProvider = managedProvider === "anthropic" || managedProvider === "openai" || managedProvider === "xai" ? managedProvider : undefined;
   function managedBindingForStep(): AiConnectionBinding | undefined {
-    if (isCopilot) return copilotConnection;
     if (credentialMode === "api" && gatewayConnection?.companyId === createdCompanyId && gatewayConnection.adapterType === adapterType) return gatewayConnection.binding;
     const restoredBinding = restoredSetup?.companyId === createdCompanyId
       && agentHarnessType(restoredSetup.adapterType, restoredSetup.adapterConfig) === agentHarnessType(adapterType, {})
@@ -850,7 +867,6 @@ function OnboardingWizardInner({
    */
   function clearCompanyScopedState() {
     setRestoredSetup(null);
-    setCopilotConnection(undefined);
     setGatewayConnection(undefined);
     setAgentAppearance(randomAgentAppearance());
     setCreatedCompanyPrefix(null);
@@ -969,7 +985,6 @@ function OnboardingWizardInner({
     const state = {
       step, companyName,
       agentName, agentAppearance, agentRole, adapterType, runner, cwd, model, command, args, url,
-      onboardingCopilot: isCopilot,
       // The mode, never the key: this blob is localStorage.
       credentialMode, credentialModeChoice,
       createdCompanyId, createdCompanyPrefix, createdAgentId, setupAgentId,
@@ -1013,7 +1028,6 @@ function OnboardingWizardInner({
     queryFn: () => instanceSettingsApi.getExperimental(),
     enabled: effectiveOnboardingOpen && step >= 3 && step <= 5,
   });
-  const copilotOnboardingEnabled = copilotOnboardingQualified;
   const loginEnvironmentResolution = useMemo(() => {
     try {
       return { environmentId: resolveAdapterTestEnvironmentId({
@@ -1042,31 +1056,21 @@ function OnboardingWizardInner({
     enabled: Boolean(createdCompanyId) && effectiveOnboardingOpen && step === 4
       && loginEnvironmentSettingsReady,
   });
-  const copilotEnvironmentReady = loginEnvironmentsReady && loginSettingsReady && loginPolicyReady && !loginEnvironmentResolution.error;
   const {
     data: adapterModels,
     error: adapterModelsError,
     isLoading: adapterModelsLoading,
     isFetching: adapterModelsFetching,
-    refetch: refreshAdapterModels,
   } = useQuery({
-    queryKey: isCopilot
-      ? ["onboarding-adapter-models", createdCompanyId, adapterType, resolvedLoginEnvironmentId, copilotConnection]
-      : createdCompanyId ? queryKeys.agents.adapterModels(createdCompanyId, adapterType, null) : ["agents", "none", "adapter-models", adapterType, null],
-    queryFn: () => agentsApi.adapterModels(createdCompanyId!, adapterType, {
-      environmentId: isCopilot ? resolvedLoginEnvironmentId : null,
-      ...(isCopilot ? { provider: "acpx", acpxAgent: "copilot", aiConnection: copilotConnection } : {}),
-    }),
-    ...(isCopilot ? COPILOT_MODEL_DISCOVERY_QUERY_OPTIONS : {}),
-    enabled: Boolean(createdCompanyId) && effectiveOnboardingOpen && step === 4 && (!isCopilot || Boolean(copilotConnection && copilotEnvironmentReady)),
+    queryKey: createdCompanyId ? queryKeys.agents.adapterModels(createdCompanyId, adapterType, null) : ["agents", "none", "adapter-models", adapterType, null],
+    queryFn: () => agentsApi.adapterModels(createdCompanyId!, adapterType, { environmentId: null }),
+    enabled: Boolean(createdCompanyId) && effectiveOnboardingOpen && step === 4 && ONBOARDING_ADAPTER_TYPES.has(adapterType),
     retry: false,
   });
-  const requestCopilotModels = Boolean(isCopilot && createdCompanyId && effectiveOnboardingOpen && step === 4 && copilotConnection && copilotEnvironmentReady);
-  const copilotModelScope = JSON.stringify([createdCompanyId, resolvedLoginEnvironmentId, copilotConnection]);
-  useEffect(() => {
-    if (requestCopilotModels) void refreshAdapterModels();
-  }, [requestCopilotModels, copilotModelScope, refreshAdapterModels]);
-  const copilotModelReady = Boolean(copilotConnection && copilotEnvironmentReady && !adapterModelsError && !adapterModelsFetching && adapterModels?.some((entry) => entry.id === model.trim()));
+  // Automatic selection uses native Claude/Codex on qualified execution targets and
+  // silently falls back to legacy on Windows, keeping the same onboarding UI.
+  // When Windows native execution is qualified, enable it in
+  // paperclipRunnerSupportsPlatform so Windows onboarding defaults to native too.
   const needsRunnerDiscovery = ["codex_local", "claude_local", "opencode_local", "pi_local"].includes(adapterType) && runner === "auto";
   const resolvedRunner = runner === "auto"
     ? runnerDiscovery.data?.find(item => item.type === adapterType)?.defaultRunner
@@ -1253,7 +1257,7 @@ function OnboardingWizardInner({
     adapterCaps.supportsSkills ||
     adapterCaps.supportsLocalAgentJwt;
   const isLocalAdapter =
-    isLocalAdapterCaps || isCopilot ||
+    isLocalAdapterCaps ||
     adapterType === "claude_local" ||
     adapterType === "codex_local" ||
     adapterType === "gemini_local" ||
@@ -1267,28 +1271,29 @@ function OnboardingWizardInner({
   const { recommendedAdapters, moreAdapters } = useMemo(() => {
     const all = listUIAdapters()
       .filter((a) =>
-        !ONBOARDING_EXCLUDED_ADAPTER_TYPES.has(a.type) &&
+        ONBOARDING_ADAPTER_TYPES.has(a.type) &&
         !disabledTypes.has(a.type) &&
         isVisualAdapterChoice(a.type)
       )
       .map((a) => ({ ...getAdapterDisplay(a.type), type: a.type }));
 
-    const copilot = copilotOnboardingEnabled && !disabledTypes.has("paperclip_runner") && listUIAdapters().some((a) => a.type === "paperclip_runner")
-      ? [{ ...getAdapterDisplay("copilot_runtime"), type: "paperclip_runner", label: "GitHub Copilot", recommended: true }]
-      : [];
     return {
-      recommendedAdapters: [...all.filter((a) => a.recommended), ...copilot],
+      recommendedAdapters: all.filter((a) => a.recommended),
       moreAdapters: all.filter((a) => !a.recommended),
     };
-  }, [disabledTypes, copilotOnboardingEnabled]);
+  }, [disabledTypes]);
 
   /**
    * A source chosen from the visible row. Read off the row rather than off
    * `adapterType` alone, because a restored draft can name an adapter this step
-   * no longer offers — a selection the customer cannot see.
+   * no longer offers — a selection the customer cannot see. The local source is
+   * not an adapter at all: it is its own answer to the row, live only while the
+   * step asks for an API key, because a local endpoint is one.
    */
+  const localLlmSelected = localLlmSource && credentialMode === "api";
   const sourceSelected =
-    sourcePicked && recommendedAdapters.some((opt) => opt.type === adapterType);
+    localLlmSelected ||
+    (sourcePicked && recommendedAdapters.some((opt) => opt.type === adapterType));
 
   /**
    * Whether the connect step may advance.
@@ -1308,9 +1313,9 @@ function OnboardingWizardInner({
    * once rather than twice.
    */
   const restoredApiCredential = restoredSetup?.companyId === createdCompanyId
-    && agentHarnessType(restoredSetup.adapterType, restoredSetup.adapterConfig) === agentHarnessType(adapterType, isCopilot ? { provider: "acpx", acpxAgent: "copilot" } : {})
+    && agentHarnessType(restoredSetup.adapterType, restoredSetup.adapterConfig) === agentHarnessType(adapterType)
     && !selectedSavedKey && (restoredSetup.adapterConfig.env as Record<string, unknown> | undefined)?.[apiKeyEnvKeyFor(adapterType)];
-  const connectStepReady = Boolean(setupPrepared || createdAgentId) && sourceSelected && !adapterEnvLoading && !savedKeys.loading && runnerDiscoveryReady && (!isCopilot || copilotModelReady) && connectionModelReady;
+  const connectStepReady = Boolean(setupPrepared || createdAgentId) && sourceSelected && !adapterEnvLoading && !savedKeys.loading && runnerDiscoveryReady && connectionModelReady;
 
   useEffect(() => {
     if (step !== 4 || !createdCompanyId || !agentName.trim() || !adapterRegistryLoaded
@@ -1327,7 +1332,7 @@ function OnboardingWizardInner({
           agent.status !== "terminated" && agent.pauseReason !== "setup"
           && agent.name.trim().toLowerCase() === agentName.trim().toLowerCase());
         const existing = sourceSelected ? sameName.find(agent => agentHarnessType(agent.adapterType, agent.adapterConfig)
-          === agentHarnessType(adapterType, isCopilot ? { provider: "acpx", acpxAgent: "copilot" } : {})) : undefined;
+          === agentHarnessType(adapterType)) : undefined;
         if (existing) { restoring = true; return existing; }
         // A same-name record may already be complete; choose its provider before adopting it.
         if (!sourceSelected && sameName.length) {
@@ -1347,7 +1352,7 @@ function OnboardingWizardInner({
       // Apply the runner only once a real source is chosen; sending a native
       // runner with the provisional process adapter is an invalid combination.
       ...(sourceSelected ? { runner } : {}),
-      adapterConfig: createAdapter === "paperclip_runner" ? { provider: "acpx", acpxAgent: "copilot" } : {},
+      adapterConfig: {},
       metadata: { setupAdapterPending: !sourceSelected },
       onboardingFirstAgent: true, runtimeConfig: buildNewAgentRuntimeConfig({ heartbeatEnabled: false }),
       });
@@ -1369,18 +1374,18 @@ function OnboardingWizardInner({
             setArgs("");
             setUrl("");
           } else {
-            setAdapterType(agentHarnessType(agent.adapterType, config) === "acpx:copilot" ? "paperclip_runner" : agentHarnessType(agent.adapterType, config) as AdapterType);
+            setAdapterType(agentHarnessType(agent.adapterType, config));
             setModel(typeof config.model === "string" ? config.model : "");
             setCommand(typeof config.command === "string" ? config.command : "");
             setArgs(Array.isArray(config.args) ? config.args.join(" ") : "");
             setUrl(typeof config.url === "string" ? config.url : "");
-            setRunner(agent.adapterType === "paperclip_runner" ? "paperclip" : "legacy");
+            setRunner(ONBOARDING_ADAPTER_TYPES.has(agentHarnessType(agent.adapterType, config))
+              ? agent.adapterType === "paperclip_runner" ? "paperclip" : "legacy" : "auto");
             const binding = agent.runtimeConfig?.aiConnection as AiConnectionBinding | undefined;
             if (binding) setCredentialMode(binding.method === "api_key" ? "api" : "subscription");
             else if ((config.env as Record<string, unknown> | undefined)?.[apiKeyEnvKeyFor(adapterType)]) setCredentialMode("api");
             else if ((config.env as Record<string, unknown> | undefined)?.[CLAUDE_OAUTH_TOKEN_ENV_KEY]
               || (config.env as Record<string, unknown> | undefined)?.CODEX_HOME) setCredentialMode("subscription");
-            if (config.provider === "acpx" && config.acpxAgent === "copilot") setCopilotConnection(binding);
           }
         }
       } else setCreatedAgentId(agent.id);
@@ -1586,7 +1591,7 @@ function OnboardingWizardInner({
    * rather than offering — see `FooterNav`, where the label cross-fades over an
    * easing width so those changes read as one control rather than four.
    */
-  const connectSourceLabel = isCopilot ? "GitHub Copilot" : CONNECT_SOURCE_NAMES[adapterType] ?? adapterType;
+  const connectSourceLabel = CONNECT_SOURCE_NAMES[adapterType] ?? adapterType;
   const connectCta: { label: string; icon: FooterPrimaryIcon; disabled: boolean } =
     setupError ? { label: "Retry", icon: "arrow", disabled: false } : connectProgress
       ? { label: adapterEnvLoading ? "Testing…" : connectProgress, icon: "spinner", disabled: true }
@@ -1605,7 +1610,11 @@ function OnboardingWizardInner({
                 label: "Connect",
                 icon: "arrow",
                 disabled:
-                  !connectStepReady || (!isCopilot && credentialMode === "api" && !apiKey.trim() && !selectedApiKey && !restoredApiCredential && !managedBindingForStep()),
+                  !connectStepReady ||
+                  (credentialMode === "api" &&
+                    (localLlmSelected
+                      ? !localLlmBaseUrl.trim() || !localLlmModel.trim() || !apiKey.trim()
+                      : !apiKey.trim() && !selectedApiKey && !restoredApiCredential && !managedBindingForStep())),
               }
           : // Nothing is chosen on arrival, and the row is what chooses. Until
             // it has been answered the button has nothing to do.
@@ -1661,6 +1670,13 @@ function OnboardingWizardInner({
     // against a source with nothing to run on.
     if (connectPhase === "connecting") return;
     if (connectStepLoggingIn) return;
+    // The local endpoint has no provider to sign in with; its credential is
+    // the key in the card and its destination is the customer's own endpoint,
+    // so its hire runs the connection path, not the adapter's.
+    if (localLlmSelected) {
+      void handleLocalLlmConnect();
+      return;
+    }
     void handleGiveHeartbeat();
   }
 
@@ -1703,18 +1719,17 @@ function OnboardingWizardInner({
     // registered once the adapters query resolves, so before that a saved
     // external adapter is indistinguishable from a disabled one - and snapping
     // would replace the customer's choice with a built-in and persist it.
-    if (!adapterRegistryLoaded || (adapterType === "paperclip_runner" && !loginPolicyReady)) return;
+    if (!adapterRegistryLoaded) return;
     const visible = [...recommendedAdapters, ...moreAdapters].filter(
       (a) => !a.comingSoon,
     );
     if (visible.length === 0) {
-      if (adapterType === "paperclip_runner" && !copilotOnboardingEnabled) { setAdapterType("claude_local"); setModel(""); setCopilotConnection(undefined); setSourcePicked(false); }
+      if (!ONBOARDING_ADAPTER_TYPES.has(adapterType)) { setAdapterType("claude_local"); setModel(""); setSourcePicked(false); }
       return;
     }
     if (visible.some((a) => a.type === adapterType)) return;
-    const next = (visible.find((a) => a.type !== "paperclip_runner") ?? visible[0]).type as AdapterType;
+    const next = visible[0].type;
     setAdapterType(next);
-    if (adapterType === "paperclip_runner") { setModel(""); setCopilotConnection(undefined); }
     // The snap is not a choice. It replaces a name the customer can no longer
     // see with the first one they can, which is the right thing to hold — but
     // holding it *as chosen* would put a filled tile and an open sign-in panel
@@ -1722,7 +1737,6 @@ function OnboardingWizardInner({
     // preselection this step was changed to stop doing. The saved answer was
     // unofferable, so the question is open again.
     setSourcePicked(false);
-    if (next === "codex_local") return;
     if (next === "opencode_local") {
       setModel(DEFAULT_OPENCODE_LOCAL_MODEL);
       return;
@@ -1736,7 +1750,7 @@ function OnboardingWizardInner({
       return;
     }
     setModel("");
-  }, [adapterRegistryLoaded, recommendedAdapters, moreAdapters, adapterType, loginPolicyReady, copilotOnboardingEnabled]);
+  }, [adapterRegistryLoaded, recommendedAdapters, moreAdapters, adapterType]);
 
   const COMMAND_PLACEHOLDERS: Record<string, string> = {
     claude_local: "claude",
@@ -1766,7 +1780,7 @@ function OnboardingWizardInner({
     setAdapterEnvResult(null);
     adapterEnvResultAppliedStoredLoginRef.current = false;
     if (adapterEnvErrorSelectionRef.current !== adapterSetupSelectionRef.current) setAdapterEnvError(null);
-  }, [step, adapterType, runner, model, command, args, url, credentialMode, apiKey, selectedSavedKey, selectedApiKey?.id, savedSubscription?.id, createdCompanyId, copilotConnection, gatewayConnection, resolvedLoginEnvironmentId, runner === "auto" ? runnerDiscovery.data?.find(item => item.type === adapterType)?.defaultRunner : undefined]);
+  }, [step, adapterType, runner, model, command, args, url, credentialMode, apiKey, selectedSavedKey, selectedApiKey?.id, savedSubscription?.id, createdCompanyId, gatewayConnection, resolvedLoginEnvironmentId, runner === "auto" ? runnerDiscovery.data?.find(item => item.type === adapterType)?.defaultRunner : undefined]);
 
   /**
    * Leaving the step puts the row back to a question.
@@ -1789,6 +1803,7 @@ function OnboardingWizardInner({
     setConnectPhase("idle");
     setConnectAuthUrl(null);
     setSourcePicked(false);
+    setLocalLlmSource(false);
     connectingSinceRef.current = null;
     setConnectCredentialStored(false);
   }, [step]);
@@ -1865,7 +1880,6 @@ function OnboardingWizardInner({
     setForceUnsetAnthropicApiKey(false);
     setUnsetAnthropicLoading(false);
     setClaudeOAuthStatus(null);
-    setCopilotConnection(undefined);
     setCreatedCompanyId(null);
     setCreatedCompanyPrefix(null);
     setCreatedAgentId(null);
@@ -2049,13 +2063,13 @@ function OnboardingWizardInner({
   function buildAdapterConfig(bindApiKey = false, setupRunner?: AgentRunner): Record<string, unknown> {
     const adapter = getUIAdapter(adapterType);
     const savedConfig = restoredSetup?.companyId === createdCompanyId
-      && agentHarnessType(restoredSetup.adapterType, restoredSetup.adapterConfig) === agentHarnessType(adapterType, isCopilot ? { provider: "acpx", acpxAgent: "copilot" } : {})
+      && agentHarnessType(restoredSetup.adapterType, restoredSetup.adapterConfig) === agentHarnessType(adapterType)
       ? restoredSetup.adapterConfig : {};
     const builtConfig = adapter.buildAdapterConfig({
       ...defaultCreateValues,
       adapterType,
       runner,
-      ...(isCopilot ? { adapterSchemaValues: { provider: "acpx", acpxAgent: "copilot" } } : adapterType === "pi_local" ? { adapterSchemaValues: savedConfig } : {}),
+      ...(adapterType === "pi_local" ? { adapterSchemaValues: savedConfig } : {}),
       resolvedRunner: setupRunner ?? resolvedRunner,
       model:
         adapterType === "gemini_local"
@@ -2136,13 +2150,12 @@ function OnboardingWizardInner({
     return { ...runtimeConfig, ...buildNewAgentRuntimeConfig({ heartbeatEnabled }), ...(binding ? { aiConnection: binding } : {}) };
   }
 
-  const setupDetailsReady = runnerDiscoveryReady && (!isCopilot || copilotModelReady);
   const setupSnapshot = step === 4 && setupPrepared && setupAgentId && !createdAgentId && !loading
     ? JSON.stringify({ name: agentName.trim() || AGENT_ROLE_LABELS[agentRole], appearance: agentAppearance,
-      ...(sourceSelected && (setupDetailsReady || isCopilot) ? {
+      ...(sourceSelected && runnerDiscoveryReady ? {
         adapterType, runner,
-        adapterConfig: setupDetailsReady ? buildAdapterConfig(Boolean(apiKeySecretRef.current?.binding)) : { provider: "acpx", acpxAgent: "copilot" },
-        ...(setupDetailsReady ? { defaultEnvironmentId: resolvedLoginEnvironmentId, runtimeConfig: buildSetupRuntimeConfig(false) } : {}),
+        adapterConfig: buildAdapterConfig(Boolean(apiKeySecretRef.current?.binding)),
+        defaultEnvironmentId: resolvedLoginEnvironmentId, runtimeConfig: buildSetupRuntimeConfig(false),
         metadata: { ...restoredSetup?.metadata, setupAdapterPending: false },
       } : {}),
     })
@@ -2358,10 +2371,6 @@ function OnboardingWizardInner({
       setError("Choose a model for this gateway connection before connecting your agent.");
       return;
     }
-    if (isCopilot && (!copilotOnboardingEnabled || !sourceSelected || !copilotModelReady)) {
-      setError("Connect GitHub Copilot and select an available model before creating this agent.");
-      return;
-    }
     if (createdAgentId) {
       setStep(5);
       return;
@@ -2431,7 +2440,7 @@ function OnboardingWizardInner({
       // hire describe it the same way — as a reference. A failure here stops the
       // hire rather than falling through to a configuration with no credential.
       let apiKeyStored = false;
-      if (!isCopilot && credentialMode === "api" && !selectedApiKey && apiKey.trim()) {
+      if (credentialMode === "api" && !selectedApiKey && apiKey.trim()) {
         apiKeyStored = await storeApiKeyUserSecret(createdCompanyId);
         if (!apiKeyStored || !isCurrent()) return;
       }
@@ -2604,6 +2613,174 @@ function OnboardingWizardInner({
         setConnectAuthUrl(null);
         setConnectPhase((phase) => phase === "connecting" ? "ready" : phase);
       }
+    }
+  }
+
+  /**
+   * The local-LLM path of the connect step: the endpoint and the model are the
+   * customer's own, so there is no provider to sign in with. The card's
+   * Connect stores the endpoint as a personal AI connection of the `local`
+   * kind and hires the agent on the OpenCode harness against it — the same
+   * machinery the board's "Local endpoint" setup uses, reached without
+   * leaving the step.
+   *
+   * It skips what the adapter path does first — the model-discovery probe and
+   * the environment test — because the provider the agent would run on is
+   * created here, one call in: it cannot already exist in the environment to
+   * be discovered, and the test would probe for a binary the card does not
+   * ask about. What the probe would add (an uninstalled harness) is reported
+   * by the first run instead, where the fix is visible, and the card says it
+   * up front.
+   */
+  async function handleLocalLlmConnect() {
+    if (!createdCompanyId) return;
+    if (hiringAgentRef.current !== null) return;
+    const attempt = ++connectAttemptRef.current;
+    const isCurrent = () =>
+      connectAttemptRef.current === attempt && stillTheSameCompany(createdCompanyId);
+    hiringAgentRef.current = attempt;
+    autoConnectStartedRef.current = true;
+    setLoading(true);
+    setError(null);
+    try {
+      // The role always holds a value (see its default); this is a
+      // narrowing, not a gate — but a hire without one must not be a
+      // hire at all.
+      if (!agentRole || !isCurrent()) return;
+      const baseUrl = localLlmBaseUrl.trim();
+      const modelId = localLlmModel.trim();
+      if (!baseUrl || !modelId) {
+        setError("Enter a base URL and a model for your local LLM.");
+        return;
+      }
+      // Validate the endpoint against the same contract the server stores on
+      // the connection, so a rejection lands on the step rather than at the
+      // hire.
+      let routing: AiProviderRouting;
+      try {
+        routing = aiProviderRoutingSchema.parse({
+          kind: localLlmKind,
+          protocol: "chat",
+          baseUrl,
+          auth: "bearer",
+          models: [{ id: modelId }],
+        });
+      } catch (err) {
+        setError(
+          err instanceof Error && err.message
+            ? err.message
+            : `That base URL is not a valid ${localLlmKind === "local" ? "local endpoint" : "gateway"}.`,
+        );
+        return;
+      }
+      if (!apiKey.trim()) {
+        setError("Enter the API key for your local LLM.");
+        return;
+      }
+      // Create the connection once, then reuse it across retries of the
+      // step: a second press must not store a second copy of the same
+      // endpoint and key.
+      if (
+        !localLlmConnectionRef.current ||
+        localLlmConnectionRef.current.companyId !== createdCompanyId
+      ) {
+        const created = await aiConnectionsApi.create(createdCompanyId, {
+          provider: "openai",
+          method: "api_key",
+          name: `My local LLM (${new URL(routing.baseUrl ?? baseUrl).host})`,
+          ownership: "personal",
+          apiKey: apiKey.trim(),
+          agentIds: [],
+          allAgents: true,
+          routing,
+        });
+        if (!isCurrent()) return;
+        localLlmConnectionRef.current = {
+          companyId: createdCompanyId,
+          connectionId: created.connectionId,
+          grantId: created.grantId,
+        };
+      }
+      const { connectionId, grantId } = localLlmConnectionRef.current;
+      const hireName = agentName.trim() || AGENT_ROLE_LABELS[agentRole];
+      // The harness names the model for the provider that injects it, and
+      // the provider is the connection — so the model is prefixed, and a
+      // value already wearing the prefix is taken as given.
+      const opencodeModel = modelId.startsWith("paperclip/") ? modelId : `paperclip/${modelId}`;
+      const adapterConfig = getUIAdapter(LOCAL_LLM_HARNESS).buildAdapterConfig({
+        ...defaultCreateValues,
+        adapterType: LOCAL_LLM_HARNESS,
+        model: opencodeModel,
+        command: "",
+        args: "",
+        url: "",
+        dangerouslySkipPermissions: true,
+        dangerouslyBypassSandbox: defaultCreateValues.dangerouslyBypassSandbox,
+      });
+      // The same adoption as the adapter path: a run that reopens the step
+      // after a hire it cannot remember must find its agent, not make a
+      // second.
+      const existingAgents = await agentsApi.list(createdCompanyId).catch(() => null);
+      if (!isCurrent()) return;
+      const existing = existingAgents?.find(
+        (agent) =>
+          agent.name.trim().toLowerCase() === hireName.toLowerCase() &&
+          agent.adapterType === LOCAL_LLM_HARNESS,
+      );
+      if (existing) {
+        if (!isCurrent()) return;
+        setCreatedAgentId(existing.id);
+        setAgentAppearance(resolveAgentAppearance(existing.appearance, existing.id));
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.agents.list(createdCompanyId)
+        });
+        setStep(5);
+        return;
+      }
+      const hire = await agentsApi.hire(createdCompanyId, {
+        name: hireName,
+        appearance: agentAppearance,
+        role: agentRole,
+        adapterType: LOCAL_LLM_HARNESS,
+        adapterConfig,
+        onboardingFirstAgent: true,
+        // A personal selection bound to the connection created above: every
+        // run this agent takes resolves that one credential, and the
+        // runtime projects it into the harness's configuration.
+        runtimeConfig: {
+          ...buildNewAgentRuntimeConfig(),
+          aiConnection: {
+            provider: "openai",
+            method: "api_key",
+            mode: "delegated",
+            connectionId,
+            grantId,
+          },
+        },
+      });
+      if (!isCurrent()) return;
+      if (hire.approval) {
+        await approvalsApi.approve(
+          hire.approval.id,
+          "Approved during onboarding first-agent setup."
+        );
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.approvals.list(createdCompanyId)
+        });
+      }
+      const agent = hire.agent;
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.agents.list(createdCompanyId)
+      });
+      if (!isCurrent()) return;
+      setCreatedAgentId(agent.id);
+      setStep(5);
+    } catch (err) {
+      if (!isCurrent()) return;
+      setError(err instanceof Error ? err.message : "Failed to connect your local LLM");
+    } finally {
+      if (hiringAgentRef.current === attempt) hiringAgentRef.current = null;
+      if (isCurrent()) setLoading(false);
     }
   }
 
@@ -3022,34 +3199,42 @@ function OnboardingWizardInner({
               {step === 4 && (
                 <motion.div key="step-4" {...stepContentMotion} exit={stepHandoff ? stepContentMotion.exit : undefined} className="space-y-8">
                   <div>
-                    {/* Sources come from `recommendedAdapters`, not a list
-                        written here — that filter is `recommended` in the
-                        display registry, so a third tile appears the day
-                        someone marks one rather than the day someone
-                        remembers to edit this file.
-
-                        Picking one starts the sign-in now. The row is the
-                        question, and answering it is what opens the card. */}
                     <ModelSourceTiles
                       label="Model source"
-                      sources={recommendedAdapters.map((opt) => ({
-                        id: opt.type,
-                        label: opt.type === "paperclip_runner" ? "GitHub Copilot" : CONNECT_SOURCE_NAMES[opt.type] ?? opt.label,
-                        icon: <ModelSourceMark type={opt.type} Fallback={opt.icon} />,
-                        ...(opt.type === "paperclip_runner" ? { credentialMode: "api" as const } : {}),
-                      }))}
+                      sources={[
+                        ...recommendedAdapters.map((opt) => ({
+                          id: opt.type,
+                          label: CONNECT_SOURCE_NAMES[opt.type] ?? opt.label,
+                          icon: <ModelSourceMark type={opt.type} Fallback={opt.icon} />,
+                        })),
+                        {
+                          id: LOCAL_LLM_SOURCE_ID,
+                          label: "Local LLM",
+                          icon: <Monitor className="size-full" />,
+                          credentialMode: "api",
+                        },
+                      ]}
                       mode={credentialMode}
                       selectedId={
-                        sourcePicked &&
-                        recommendedAdapters.some((opt) => opt.type === adapterType)
-                          ? adapterType
-                          : null
+                        localLlmSelected
+                          ? LOCAL_LLM_SOURCE_ID
+                          : sourcePicked &&
+                            recommendedAdapters.some((opt) => opt.type === adapterType)
+                            ? adapterType
+                            : null
                       }
                       collapsed={connectCollapsed}
                       settling={connectPhase === "unwindRow"}
                       onSelect={(id) => {
                         if (connectPhase !== "idle") return;
                         autoConnectStartedRef.current = false;
+                        if (id === LOCAL_LLM_SOURCE_ID) {
+                          setLocalLlmSource(true);
+                          setCredentialMode("api");
+                          setConnectPhase("collapsing");
+                          return;
+                        }
+                        setLocalLlmSource(false);
                         setSourcePicked(true);
                         setAdapterType(id);
                         if (id !== adapterType) setRunner("auto");
@@ -3060,6 +3245,13 @@ function OnboardingWizardInner({
                         setConnectPhase("collapsing");
                       }}
                     />
+
+                    {adapterRegistryLoaded && recommendedAdapters.length === 0 && (
+                      <p role="status" className="text-sm text-muted-foreground">
+                        Claude and Codex are unavailable on this instance. Ask an administrator to enable one,
+                        or exit setup and choose New Agent on the Agents page to use another provider.
+                      </p>
+                    )}
 
                     {/* Fades on the first beat but keeps its space until the
                         second, so pressing a tile moves nothing vertically.
@@ -3075,11 +3267,11 @@ function OnboardingWizardInner({
                         answering to a keyboard and still able to change the
                         credential mode out from under a running sign-in.
                       */
-                      inert={!connectLinkVisible}
+                      inert={!connectLinkVisible || localLlmSource}
                       initial={false}
                       animate={{
-                        opacity: connectLinkVisible ? 1 : 0,
-                        height: connectLinkSpace ? "auto" : 0,
+                        opacity: connectLinkVisible && !localLlmSource ? 1 : 0,
+                        height: connectLinkSpace && !localLlmSource ? "auto" : 0,
                       }}
                       transition={{ opacity: SOURCE_LINK_EXIT, height: MAKE_ROOM }}
                     >
@@ -3132,87 +3324,114 @@ function OnboardingWizardInner({
                         <Loader2 className="size-4 animate-spin" />
                         {connectProgress}
                       </p>
-                    ) : isCopilot && createdCompanyId ? (
-                      <OnboardingLoginCard instruction="Connect GitHub Copilot and choose a model">
-                        {!copilotEnvironmentReady ? <p role="alert" className="text-sm text-destructive">{loginEnvironmentResolution.error ?? "Waiting for execution environment settings. If this persists, check your instance settings."}</p> : <>
-                          <AiConnectionField companyId={createdCompanyId} agentName={agentName} adapterType="copilot_runtime" environmentId={resolvedLoginEnvironmentId ?? undefined} value={copilotConnection} onChange={(binding) => {
-                            const parsed = aiConnectionBindingSchema.safeParse(binding);
-                            if (!parsed.success || parsed.data.provider !== "github" || parsed.data.method !== "api_key") {
-                              setError("Choose a GitHub Copilot token connection for this source.");
-                              return;
-                            }
-                            setError(null);
-                            setCopilotConnection(parsed.data);
-                            setModel("");
-                            if (JSON.stringify(copilotConnection) === JSON.stringify(parsed.data)) void refreshAdapterModels();
-                          }} />
-                          {copilotConnection && <label className="block space-y-2 text-sm">
-                            <span>Model</span>
-                            <select aria-label="Copilot model" className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={model} disabled={adapterModelsFetching} onChange={(event) => setModel(event.target.value)}>
-                              <option value="">{adapterModelsFetching ? "Loading models…" : "Select a model"}</option>
-                              {model && !adapterModels?.some((entry) => entry.id === model) && <option value={model}>{model} (unavailable)</option>}
-                              {(adapterModels ?? []).map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
-                            </select>
-                            {adapterModelsError && <p role="alert" className="text-destructive">{adapterModelsError instanceof Error ? adapterModelsError.message : "Could not discover Copilot models."}</p>}
-                            {!adapterModelsFetching && !adapterModelsError && adapterModels?.length === 0 && <p role="alert" className="text-destructive">No available Copilot models were discovered. Check this account’s Copilot access.</p>}
-                            <Button type="button" variant="ghost" disabled={adapterModelsFetching} onClick={() => void refreshAdapterModels()}>Refresh models</Button>
-                          </label>}
-                        </>}
-                      </OnboardingLoginCard>
                     ) : credentialMode === "api" ? (
-                      <OnboardingLoginCard
-                        instruction={hasGatewaySelection || connectionModels ? "Choose a model for your saved connection" : savedKeys.options.length ? "Choose a saved API key or enter a new one" : `Provide your ${
-                          CONNECT_SOURCE_NAMES[adapterType] ?? adapterType
-                        } API key to connect`}
-                      >
-                        {!hasGatewaySelection && <SavedProviderKeySelect {...savedKeys} disabled={loading || adapterEnvLoading} value={selectedApiKey?.id ?? ""} onChange={(id) => {
-                          setGatewayConnection(undefined);
-                          if (connectionModels) setModel("");
-                          setSelectedSavedKey(createdCompanyId ? { companyId: createdCompanyId, envKey: apiKeyEnvKeyFor(adapterType), id } : null);
-                          setApiKey("");
-                        }} />}
-                        {!selectedApiKey && !hasGatewaySelection && !connectionModels && <OnboardingCardField
-                          label="API key"
-                          placeholder="Enter API key here"
-                          masked
-                          // The card is the answer to the tile just pressed, so
-                          // the field is unambiguously the next thing. Carried
-                          // over from the key field this card replaced.
-                          autoFocus
-                          value={apiKey}
-                          onChange={(value) => {
-                            setSelectedSavedKey(createdCompanyId ? { companyId: createdCompanyId, envKey: apiKeyEnvKeyFor(adapterType), id: "" } : null);
-                            setApiKey(value);
-                          }}
-                          onSubmit={() => handleConnectStepPrimary()}
-                        />}
-                        {hasGatewaySelection && (gatewayLookupFailed ? <>
-                          <p role="alert" className="text-sm text-destructive">Your saved gateway connection could not be loaded. Retry to choose a model and connect your agent.</p>
-                          <Button type="button" variant="outline" disabled={loading || adapterEnvLoading} onClick={() => { void connectionModelState.refresh(); }}>
-                            Retry loading connection
-                          </Button>
-                        </> : <p role="status" className="text-sm text-muted-foreground">{connectionModelState.refreshing
-                          ? "Loading your saved gateway connection…"
-                          : "Gateway connection saved. Choose a model, then Connect to test it and finish setting up your agent."}</p>)}
-                        {connectionModels && <ModelDropdown models={connectionModels.models} value={model}
-                          onChange={setModel} open={modelOpen} onOpenChange={setModelOpen}
-                          allowDefault={false} required groupByProvider={false}
-                          creatable={connectionModels.models.length === 0} presentation="native" />}
-                        {createdCompanyId && (adapterType === "codex_local" || adapterType === "claude_local") && <OnboardingGatewaySetup
-                          companyId={createdCompanyId} agentId={setupAgentId ?? undefined} environmentId={resolvedLoginEnvironmentId ?? undefined}
-                          adapterType={adapterType} disabled={loading || adapterEnvLoading}
-                          onComplete={binding => {
-                            setGatewayConnection({ companyId: createdCompanyId, adapterType, binding });
+                      localLlmSelected ? (
+                        /* The card for the third source: an endpoint the
+                           customer runs, not a provider to sign in with. The
+                           fields are the whole answer — where, which model,
+                           and the key it wants. */
+                        <div className="space-y-2">
+                          <OnboardingLoginCard
+                            instruction={
+                              localLlmKind === "local"
+                                ? "Point Paperclip at your own model server — an OpenAI-compatible endpoint on this machine or your network."
+                                : "Point Paperclip at any OpenAI-compatible gateway — NVIDIA NIM, Ollama, vLLM, LiteLLM, or another custom endpoint."
+                            }
+                          >
+                            <OnboardingCardField
+                              label="Type"
+                              placeholder="Local or custom gateway"
+                              value={localLlmKind === "local" ? "Local LLM" : "Custom gateway"}
+                              onChange={(value) => setLocalLlmKind(value === "Local LLM" ? "local" : "gateway")}
+                              onSubmit={() => handleConnectStepPrimary()}
+                            />
+                            <OnboardingCardField
+                              label="Base URL"
+                              placeholder={
+                                localLlmKind === "local"
+                                  ? "http://192.168.1.130:4000/v1"
+                                  : "https://integrate.api.nvidia.com/v1"
+                              }
+                              value={localLlmBaseUrl}
+                              onChange={(value) => setLocalLlmBaseUrl(value)}
+                              onSubmit={() => handleConnectStepPrimary()}
+                            />
+                            <OnboardingCardField
+                              label="Model"
+                              placeholder="qwen3.8-27b"
+                              value={localLlmModel}
+                              onChange={(value) => setLocalLlmModel(value)}
+                              onSubmit={() => handleConnectStepPrimary()}
+                            />
+                            <OnboardingCardField
+                              label="API key"
+                              placeholder="Enter API key here"
+                              masked
+                              autoFocus
+                              value={apiKey}
+                              onChange={setApiKey}
+                              onSubmit={() => handleConnectStepPrimary()}
+                            />
+                          </OnboardingLoginCard>
+                          <p className="text-xs text-muted-foreground">
+                            Runs on the OpenCode harness. If it is not installed yet:{" "}
+                            <code className="font-mono">
+                              curl -fsSL https://opencode.ai/install | bash
+                            </code>
+                          </p>
+                        </div>
+                      ) : (
+                        <OnboardingLoginCard
+                          instruction={hasGatewaySelection || connectionModels ? "Choose a model for your saved connection" : savedKeys.options.length ? "Choose a saved API key or enter a new one" : `Provide your ${
+                            CONNECT_SOURCE_NAMES[adapterType] ?? adapterType
+                          } API key to connect`}
+                        >
+                          {!hasGatewaySelection && <SavedProviderKeySelect {...savedKeys} disabled={loading || adapterEnvLoading} value={selectedApiKey?.id ?? ""} onChange={(id) => {
+                            setGatewayConnection(undefined);
+                            if (connectionModels) setModel("");
+                            setSelectedSavedKey(createdCompanyId ? { companyId: createdCompanyId, envKey: apiKeyEnvKeyFor(adapterType), id } : null);
                             setApiKey("");
-                            setModel("");
-                            setError(null);
                           }} />}
-                        {(hasGatewaySelection || connectionModels) && <Button type="button" variant="ghost" disabled={loading || adapterEnvLoading} onClick={() => {
-                          setGatewayConnection(undefined);
-                          setSelectedSavedKey({ companyId: createdCompanyId!, envKey: apiKeyEnvKeyFor(adapterType), id: "" });
-                          setModel("");
-                        }}>Use a different API key</Button>}
-                      </OnboardingLoginCard>
+                          {!selectedApiKey && !hasGatewaySelection && !connectionModels && <OnboardingCardField
+                            label="API key"
+                            placeholder="Enter API key here"
+                            masked
+                            autoFocus
+                            value={apiKey}
+                            onChange={(value) => {
+                              setSelectedSavedKey(createdCompanyId ? { companyId: createdCompanyId, envKey: apiKeyEnvKeyFor(adapterType), id: "" } : null);
+                              setApiKey(value);
+                            }}
+                            onSubmit={() => handleConnectStepPrimary()}
+                          />}
+                          {hasGatewaySelection && (gatewayLookupFailed ? <>
+                            <p role="alert" className="text-sm text-destructive">Your saved gateway connection could not be loaded. Retry to choose a model and connect your agent.</p>
+                            <Button type="button" variant="outline" disabled={loading || adapterEnvLoading} onClick={() => { void connectionModelState.refresh(); }}>
+                              Retry loading connection
+                            </Button>
+                          </> : <p role="status" className="text-sm text-muted-foreground">{connectionModelState.refreshing
+                            ? "Loading your saved gateway connection…"
+                            : "Gateway connection saved. Choose a model, then Connect to test it and finish setting up your agent."}</p>)}
+                          {connectionModels && <ModelDropdown models={connectionModels.models} value={model}
+                            onChange={setModel} open={modelOpen} onOpenChange={setModelOpen}
+                            allowDefault={false} required groupByProvider={false}
+                            creatable={connectionModels.models.length === 0} presentation="native" />}
+                          {createdCompanyId && (adapterType === "codex_local" || adapterType === "claude_local") && <OnboardingGatewaySetup
+                            companyId={createdCompanyId} agentId={setupAgentId ?? undefined} environmentId={resolvedLoginEnvironmentId ?? undefined}
+                            adapterType={adapterType} disabled={loading || adapterEnvLoading}
+                            onComplete={binding => {
+                              setGatewayConnection({ companyId: createdCompanyId, adapterType, binding });
+                              setApiKey("");
+                              setModel("");
+                              setError(null);
+                            }} />}
+                          {(hasGatewaySelection || connectionModels) && <Button type="button" variant="ghost" disabled={loading || adapterEnvLoading} onClick={() => {
+                            setGatewayConnection(undefined);
+                            setSelectedSavedKey({ companyId: createdCompanyId!, envKey: apiKeyEnvKeyFor(adapterType), id: "" });
+                            setModel("");
+                          }}>Use a different API key</Button>}
+                        </OnboardingLoginCard>
+                      )
                     ) : connectStepNeedsLogin &&
                       createdCompanyId &&
                       resolvedLoginEnvironmentId ? (
@@ -3324,8 +3543,6 @@ function OnboardingWizardInner({
                   </details>}
 
                   {/* Conditional adapter fields */}
-                  {/* Direct adapters resolve their defaults. Copilot requires
-                      an explicit authenticated model in its connection card. */}
 
                   {/* Progress is shown above; failed checks remain actionable here. */}
                   {/* Not while the hire is in flight. The probe's result lands
