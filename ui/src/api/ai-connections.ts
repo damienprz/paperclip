@@ -12,5 +12,14 @@ export const aiConnectionsApi = {
   list: (companyId: string, agentId?: string) => api.get<AiConnectionList>(`/companies/${companyId}/ai-connections${agentId ? `?agentId=${encodeURIComponent(agentId)}` : ""}`),
   create: (companyId: string, input: CreateAiConnection) => api.post<{ connectionId: string; grantId: string }>(`/companies/${companyId}/ai-connections`, input),
   setDefault: (companyId: string, grantId: string) => api.put(`/companies/${companyId}/ai-connections/default`, { grantId }),
+  fetchModels: (companyId: string, input: {
+    connectionId?: string;
+    baseUrl?: string;
+    apiKey?: string;
+  }) =>
+    api.post<Array<{ id: string; label: string }>>(
+      `/companies/${companyId}/ai-connections/fetch-models`,
+      input,
+    ),
   loginResult: (companyId: string, sessionId: string) => api.get<{ connectionId: string; grantId: string }>(`/companies/${companyId}/ai-connections/login/${encodeURIComponent(sessionId)}`),
 };

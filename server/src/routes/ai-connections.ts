@@ -26,6 +26,7 @@ import {
   type AiProvider,
   type AiConnectionBinding,
   type AiConnectionList,
+  type AiProviderRouting,
   aiConnectionPoolConfigSchema,
 } from "@paperclipai/shared";
 import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getActorInfo } from "./authz.js";
@@ -327,6 +328,96 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
   );
   router.post(
     "/companies/:companyId/ai-connections/local", managementGuard("connections:configure", "POST /companies/:companyId/ai-connections/local", { personal: true }),
+  );
+  router.post(
+    "/companies/:companyId/ai-connections/fetch-models",
+    validate(
+      z.object({
+        connectionId: z.string().uuid().optional(),
+        baseUrl: z.string().url().optional(),
+        apiKey: z.string().optional(),
+      }),
+    ),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertBoard(req);
+      assertCompanyAccess(req, companyId);
+      const { connectionId, baseUrl: bodyBaseUrl, apiKey } = req.body;
+
+      let routing: AiProviderRouting | undefined;
+      let key = apiKey;
+
+      if (connectionId) {
+        const [connection] = await db
+          .select()
+          .from(toolConnections)
+          .where(
+            and(
+              eq(toolConnections.companyId, companyId),
+              eq(toolConnections.id, connectionId),
+              eq(toolConnections.connectionPurpose, "ai"),
+            ),
+          );
+
+        if (!connection) throw notFound("AI connection not found");
+
+        const config = connection.config as {
+          routing?: AiProviderRouting;
+          apiKey?: string;
+        } | undefined;
+        routing = config?.routing;
+        key = apiKey ?? config?.apiKey;
+      } else if (bodyBaseUrl) {
+        routing = {
+          kind: "gateway",
+          protocol: "chat",
+          auth: "bearer",
+          baseUrl: bodyBaseUrl,
+        } as AiProviderRouting;
+      }
+
+      if (!routing || routing.kind !== "gateway" || !routing.baseUrl) {
+        throw unprocessable(
+          "This connection is not a custom gateway with a base URL",
+        );
+      }
+
+      if (!key) {
+        throw unprocessable(
+          "API key is required to fetch models from this gateway",
+        );
+      }
+
+      const url = new URL(
+        "/models",
+        routing.baseUrl.replace(/\/+$/, ""),
+      ).toString();
+
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          headers: { Authorization: `Bearer ${key}` },
+        });
+      } catch {
+        throw unprocessable("Unable to reach the gateway base URL");
+      }
+
+      if (!response.ok) {
+        throw unprocessable(
+          `Gateway returned ${response.status} while fetching models`,
+        );
+      }
+
+      const data = await response.json();
+      const models = Array.isArray(data?.data)
+        ? data.data.map((m: { id: string }) => ({ id: m.id, label: m.id }))
+        : [];
+
+      res.json({ models });
+    },
+  );
+  router.post(
+    "/companies/:companyId/ai-connections/local",
     validate(localAiConnectionSchema),
     async (req, res) => {
       const companyId = req.params.companyId as string;

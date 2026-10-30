@@ -715,6 +715,7 @@ function OnboardingWizardInner({
   // credential either way — while the endpoint and the model are this
   // source's own.
   const [localLlmSource, setLocalLlmSource] = useState(false);
+  const [localLlmKind, setLocalLlmKind] = useState<"local" | "gateway">("local");
   const [localLlmBaseUrl, setLocalLlmBaseUrl] = useState("");
   const [localLlmModel, setLocalLlmModel] = useState("");
   /**
@@ -2658,7 +2659,7 @@ function OnboardingWizardInner({
       let routing: AiProviderRouting;
       try {
         routing = aiProviderRoutingSchema.parse({
-          kind: "local",
+          kind: localLlmKind,
           protocol: "chat",
           baseUrl,
           auth: "bearer",
@@ -2668,7 +2669,7 @@ function OnboardingWizardInner({
         setError(
           err instanceof Error && err.message
             ? err.message
-            : "That base URL is not a valid local endpoint.",
+            : `That base URL is not a valid ${localLlmKind === "local" ? "local endpoint" : "gateway"}.`,
         );
         return;
       }
@@ -3331,11 +3332,26 @@ function OnboardingWizardInner({
                            and the key it wants. */
                         <div className="space-y-2">
                           <OnboardingLoginCard
-                            instruction="Point Paperclip at your own model server — an OpenAI-compatible endpoint on this machine or your network."
+                            instruction={
+                              localLlmKind === "local"
+                                ? "Point Paperclip at your own model server — an OpenAI-compatible endpoint on this machine or your network."
+                                : "Point Paperclip at any OpenAI-compatible gateway — NVIDIA NIM, Ollama, vLLM, LiteLLM, or another custom endpoint."
+                            }
                           >
                             <OnboardingCardField
+                              label="Type"
+                              placeholder="Local or custom gateway"
+                              value={localLlmKind === "local" ? "Local LLM" : "Custom gateway"}
+                              onChange={(value) => setLocalLlmKind(value === "Local LLM" ? "local" : "gateway")}
+                              onSubmit={() => handleConnectStepPrimary()}
+                            />
+                            <OnboardingCardField
                               label="Base URL"
-                              placeholder="http://192.168.1.130:4000/v1"
+                              placeholder={
+                                localLlmKind === "local"
+                                  ? "http://192.168.1.130:4000/v1"
+                                  : "https://integrate.api.nvidia.com/v1"
+                              }
                               value={localLlmBaseUrl}
                               onChange={(value) => setLocalLlmBaseUrl(value)}
                               onSubmit={() => handleConnectStepPrimary()}

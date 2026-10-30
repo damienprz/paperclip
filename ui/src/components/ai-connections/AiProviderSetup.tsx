@@ -121,6 +121,11 @@ export function AiProviderSetup({
     reconnect?.routing?.models.map((m) => m.id).join(", ") ?? "",
   );
   const [apiKey, setApiKey] = useState("");
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [discoveredModels, setDiscoveredModels] = useState<
+    Array<{ id: string; label: string }>
+  >([]);
+  const [fetchError, setFetchError] = useState<string | null>(null);
   const client = useQueryClient();
   const accounts = useQuery({
     queryKey: ["ai-connections", companyId, agentId],
@@ -369,6 +374,66 @@ export function AiProviderSetup({
                 </Select>
               </label>
             </>
+          )}
+          {(provider === "gateway" || provider === "local") && baseUrl && (
+            <div className="flex flex-col gap-2">
+              {fetchError && (
+                <p role="alert" className="text-xs text-destructive">
+                  {fetchError}
+                </p>
+              )}
+              <div className="flex items-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={fetchingModels || !apiKey.trim()}
+                  onClick={async () => {
+                    setFetchError(null);
+                    setFetchingModels(true);
+                    try {
+                      const models = await aiConnectionsApi.fetchModels(
+                        companyId,
+                        { baseUrl, apiKey },
+                      );
+                      setDiscoveredModels(models);
+                    } catch (err) {
+                      setFetchError(
+                        err instanceof Error
+                          ? err.message
+                          : "Failed to fetch models from gateway",
+                      );
+                    } finally {
+                      setFetchingModels(false);
+                    }
+                  }}
+                >
+                  {fetchingModels
+                    ? "Importing models…"
+                    : "Import models from API"}
+                </Button>
+                {discoveredModels.length > 0 && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      setModels(
+                        discoveredModels.map((m) => m.id).join(", "),
+                      );
+                      setDiscoveredModels([]);
+                      setFetchError(null);
+                    }}
+                  >
+                    Use {discoveredModels.length} model(s)
+                  </Button>
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Queries GET {baseUrl}/models and lists the models reported by
+                the gateway.
+              </p>
+            </div>
           )}
           {provider === "bedrock" && (
             <label className="block space-y-2 text-xs text-muted-foreground">
