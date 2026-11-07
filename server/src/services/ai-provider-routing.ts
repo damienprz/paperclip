@@ -1,9 +1,15 @@
+import { createHash } from "node:crypto";
 import { OPENROUTER_ATTRIBUTION_HEADERS, isOpenRouterUrl, openRouterClaudeHeaders, openRouterCodexHeaders } from "@paperclipai/shared/openrouter-attribution";
+import { isOpenocodeGatewayUrl, opencodeClientHeaders } from "@paperclipai/shared/opencode-gateway";
 import {
   aiRoutingBaseUrl,
   aiRoutingModel,
   type AiProviderRouting,
 } from "@paperclipai/shared";
+
+/** Deterministic stable session id for one connection+model projection (opaque, never credential-derived). */
+const opencodeSessionId = (baseUrl: string, model: string) =>
+  createHash("sha256").update([baseUrl, model].join("\u0000")).digest("hex").slice(0, 32);
 
 /** Projects one authoritative connection into an isolated harness environment. */
 export function managedProviderRouting(
@@ -55,13 +61,22 @@ export function managedProviderRouting(
     const id = model.startsWith(`${provider}/`)
       ? model.slice(provider.length + 1)
       : model;
+    const opencodeGateway =
+      !openrouter && isOpenocodeGatewayUrl(baseUrl);
     env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
       provider: {
         [provider]: {
           ...(provider === "paperclip"
             ? { npm: "@ai-sdk/openai-compatible", name: "Paperclip connection" }
             : {}),
-          options: { baseURL: baseUrl, apiKey: credential, ...(openrouter ? { headers: OPENROUTER_ATTRIBUTION_HEADERS } : {}) },
+          options: {
+            baseURL: baseUrl,
+            apiKey: credential,
+            ...(openrouter ? { headers: OPENROUTER_ATTRIBUTION_HEADERS } : {}),
+            ...(opencodeGateway
+              ? { headers: opencodeClientHeaders(opencodeSessionId(baseUrl, model)) }
+              : {}),
+          },
           models: id ? { [id]: { name: id } } : {},
         },
       },

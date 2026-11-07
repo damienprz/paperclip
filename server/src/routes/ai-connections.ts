@@ -323,9 +323,6 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
     },
   );
   router.post(
-    "/companies/:companyId/ai-connections/local", managementGuard("connections:configure", "POST /companies/:companyId/ai-connections/local", { personal: true }),
-  );
-  router.post(
     "/companies/:companyId/ai-connections/fetch-models",
     validate(
       z.object({

@@ -28,6 +28,7 @@ import {
   aiRoutingModel,
   aiRuntimeConnectionBindingSchema,
   type AiConnectionBinding,
+  type AiProviderRouting,
   type AiRuntimeConnectionBinding,
 } from "@paperclipai/shared";
 import { toolConnections } from "@paperclipai/db";
@@ -3087,30 +3088,36 @@ export function agentRoutes(
       catch { /* Ignore parsing errors */ }
     }
 
-    if (aiConnectionBinding && "routing" in aiConnectionBinding && aiConnectionBinding.routing && (aiConnectionBinding.routing.kind === "local" || aiConnectionBinding.routing.kind === "gateway")) {
-      const routing = {
-        kind: aiConnectionBinding.routing.kind,
-        protocol: aiConnectionBinding.routing.protocol ?? "chat",
-        auth: aiConnectionBinding.routing.auth ?? "none",
-        baseUrl: aiConnectionBinding.routing.baseUrl,
-        models: aiConnectionBinding.routing.models ?? [],
-      } as const;
-      const baseUrl = aiRoutingBaseUrl(routing, type);
-      if (baseUrl) {
-        try {
-          const response = await fetch(`${baseUrl}/models`, { signal: AbortSignal.timeout(10_000) });
-          if (response.ok) {
-            const body = await response.json() as { data?: Array<{ id?: unknown; name?: unknown }> };
-            if (Array.isArray(body.data)) {
-              const models = body.data.flatMap(model => typeof model.id === "string"
-                ? [{ id: model.id, label: typeof model.name === "string" ? model.name : model.id }]
-                : []);
-              res.json(models);
-              return;
+    if (aiConnectionBinding && "routing" in aiConnectionBinding && aiConnectionBinding.routing) {
+      const routing = aiConnectionBinding.routing as AiProviderRouting;
+      if (routing.kind === "local" || routing.kind === "gateway") {
+        // Prefer the model catalog saved with the connection: gateways that
+        // require authentication reject an unauthenticated /models fetch.
+        const savedModels = (routing.models ?? []).filter(
+          (model): model is { id: string; label?: string } => typeof model?.id === "string" && model.id.length > 0,
+        );
+        if (savedModels.length) {
+          res.json(savedModels.map(model => ({ id: model.id, label: model.label ?? model.id })));
+          return;
+        }
+        const baseUrl = aiRoutingBaseUrl(routing, type);
+        if (baseUrl) {
+          try {
+            const response = await fetch(`${baseUrl}/models`, { signal: AbortSignal.timeout(10_000) });
+            if (response.ok) {
+              const body = await response.json() as { data?: Array<{ id?: unknown; name?: unknown }> };
+              if (Array.isArray(body.data)) {
+                const models = body.data.flatMap((model): { id: string; label: string }[] => {
+                  if (typeof model.id !== "string") return [];
+                  return [{ id: model.id, label: typeof model.name === "string" ? model.name : model.id }];
+                });
+                res.json(models);
+                return;
+              }
             }
+          } catch {
+            // Fall through to adapter refresh if dynamic discovery fails
           }
-        } catch {
-          // Fall through to adapter refresh if dynamic discovery fails
         }
       }
     }
@@ -3122,10 +3129,6 @@ export function agentRoutes(
         : provider === "opencode" ? "opencode_local"
           : provider === "aws_agentcore" ? type : "codex_local"
       : type;
-    if (modelAdapterType === "opencode_local" && environment && environment.driver !== "local") {
-      res.json(requireServerAdapter(modelAdapterType).models ?? []);
-      return;
-    }
     const models = refresh
       ? await refreshAdapterModels(modelAdapterType)
       : await listAdapterModels(modelAdapterType);
