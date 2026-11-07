@@ -1,4 +1,6 @@
 import { isOpenRouterUrl, OPENROUTER_ATTRIBUTION_HEADERS } from "../openrouter-attribution.js";
+import { isOpenocodeGatewayUrl, opencodeClientHeaders } from "../opencode-gateway.js";
+import type { OutgoingHttpHeaders } from "node:http";
 import { spawn, type ChildProcess } from "node:child_process";
 import { resolveCompletionContinuation } from "../completion-continuation.js";
 import { createHash, randomBytes } from "node:crypto";
@@ -394,6 +396,7 @@ export class OpenCodeServerDriver implements HarnessDriver {
           root,
           cwd,
           trace,
+          opencodeSessionId: input.normalizedSessionId,
           dispatch: (call) => {
             if (session === null)
               throw new Error("OpenCode session is not ready for tool calls");
@@ -2179,7 +2182,14 @@ class OpenCodeHarnessSession implements HarnessSession {
 }
 
 /** Retain the reusable gateway key in the runner; the harness gets a session-scoped capability. */
-async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: string, environment: NodeJS.ProcessEnv) {
+async function startOpenCodeProviderProxy(
+  baseUrl: string,
+  key: string,
+  model: string,
+  environment: NodeJS.ProcessEnv,
+  /** Stable Paperclip conversation id; hashed into an opaque gateway session id. */
+  normalizedSessionId: string,
+) {
   const upstreamUrl = new URL(`${baseUrl.replace(/\/+$/, "")}/chat/completions`);
   const token = randomBytes(32).toString("base64url");
   // Agent-local settings keep one runtime's transport configuration out of other sessions.
@@ -2232,11 +2242,25 @@ async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: s
         response.writeHead(400).end();
         return;
       }
+      const upstreamHeaders: OutgoingHttpHeaders = {
+        "Content-Type": "application/json",
+        "Content-Length": body.length,
+        ...(key ? { Authorization: `Bearer ${key}` } : {}),
+      };
+      if (isOpenRouterUrl(baseUrl)) Object.assign(upstreamHeaders, OPENROUTER_ATTRIBUTION_HEADERS);
+      if (isOpenocodeGatewayUrl(baseUrl) && normalizedSessionId) {
+        // OpenCode gateways reject model requests without a stable per-conversation
+        // session id; hash the conversation id so the wire value stays opaque.
+        Object.assign(
+          upstreamHeaders,
+          opencodeClientHeaders(createHash("sha256").update(`opencode-gateway:${normalizedSessionId}`).digest("hex").slice(0, 32)),
+        );
+      }
       const upstream = await new Promise<IncomingMessage>((resolve, reject) => {
         const outgoing = (upstreamUrl.protocol === "https:" ? requestHttps : requestHttp)(upstreamUrl, {
           method: "POST",
           agent,
-          headers: { ...(isOpenRouterUrl(baseUrl) ? OPENROUTER_ATTRIBUTION_HEADERS : {}), "Content-Type": "application/json", "Content-Length": body.length, ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+          headers: upstreamHeaders,
           signal: AbortSignal.any([controller.signal, AbortSignal.timeout(600_000)]),
         }, resolve);
         outgoing.once("error", reject);
@@ -2288,6 +2312,8 @@ async function startRuntime(input: {
   root: string;
   cwd: string;
   trace: ProviderTraceFileSink | null;
+  /** Stable Paperclip conversation id, forwarded to gateway-side provider proxies. */
+  opencodeSessionId: string;
   dispatch: (call: {
     tool: string;
     callId: string;
@@ -2365,7 +2391,7 @@ async function startRuntime(input: {
       ? { baseUrl: input.options.environment.PAPERCLIP_AI_PROVIDER_URL, key: input.options.environment.PAPERCLIP_AI_PROVIDER_KEY ?? "" }
       : null;
   const providerProxy = providerRoute
-    ? await startOpenCodeProviderProxy(providerRoute.baseUrl, providerRoute.key, providerModelId, providerEnvironment).catch(async error => {
+    ? await startOpenCodeProviderProxy(providerRoute.baseUrl, providerRoute.key, providerModelId, providerEnvironment, input.opencodeSessionId).catch(async error => {
         await bridge.close().catch(() => {});
         await removeIsolatedHome(isolatedHome).catch(() => {});
         throw error;

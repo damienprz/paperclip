@@ -148,6 +148,42 @@ describe("provider routing", () => {
       "openrouter/anthropic/claude-sonnet-4.6",
     );
   });
+  it("projects an OpenCode gateway connection with a stable session header and no credential leak", () => {
+    const routing = aiProviderRoutingSchema.parse({
+      kind: "gateway",
+      protocol: "chat",
+      auth: "bearer",
+      baseUrl: "https://opencode.ai/zen/go/v1",
+    });
+    const projected = managedProviderRouting(
+      routing,
+      "opencode_local",
+      "fixture-secret",
+      "deepseek-v4-flash",
+    );
+    const content = JSON.parse(projected.env.OPENCODE_CONFIG_CONTENT);
+    const options = content.provider.paperclip.options;
+    expect(options.baseURL).toBe("https://opencode.ai/zen/go/v1");
+    expect(options.headers["x-opencode-session"]).toMatch(/^[0-9a-f]{32}$/);
+    expect(options.headers["x-opencode-client"]).toBe("paperclip");
+    // Stable across re-projection of the same connection+model.
+    const again = managedProviderRouting(routing, "opencode_local", "fixture-secret", "deepseek-v4-flash");
+    expect(JSON.parse(again.env.OPENCODE_CONFIG_CONTENT).provider.paperclip.options.headers["x-opencode-session"])
+      .toBe(options.headers["x-opencode-session"]);
+    // Unrelated gateways do not get OpenCode session headers.
+    const other = managedProviderRouting(
+      aiProviderRoutingSchema.parse({
+        kind: "gateway",
+        protocol: "chat",
+        auth: "bearer",
+        baseUrl: "https://integrate.api.nvidia.com/v1",
+      }),
+      "opencode_local",
+      "fixture-secret",
+      "nvidia/nemotron-3-ultra",
+    );
+    expect(JSON.parse(other.env.OPENCODE_CONFIG_CONTENT).provider.paperclip.options.headers).toBeUndefined();
+  });
   it("projects only a Bedrock API key and rejects general AWS access keys", () => {
     const routing = aiProviderRoutingSchema.parse({
       kind: "bedrock",

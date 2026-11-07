@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { providerUsageReceipt as fastResponseReceipt } from "./provider-usage.js";
 export { providerUsageReceipt as fastResponseReceipt } from "./provider-usage.js";
 import { isOpenRouterUrl, OPENROUTER_ATTRIBUTION_HEADERS } from "@paperclipai/shared/openrouter-attribution";
+import { isOpenocodeGatewayUrl, opencodeClientHeaders } from "@paperclipai/shared/opencode-gateway";
 import { generateText, type LanguageModel } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
@@ -99,11 +101,18 @@ export function fastResponseModel(
 ): Extract<LanguageModel, { specificationVersion: "v4" }> {
   const { metadata, credential, model } = input,
     route = metadata.routing;
+  const opencodeGatewayHeaders = (() => {
+    const baseUrl = typeof route?.baseUrl === "string" ? route.baseUrl : "";
+    if (!isOpenocodeGatewayUrl(baseUrl) || !model) return {};
+    const sessionId = createHash("sha256").update([baseUrl, model].join("\u0000")).digest("hex").slice(0, 32);
+    return opencodeClientHeaders(sessionId);
+  })();
   const guardedFetch: typeof fetch = async (url, init) => {
     const headers = new Headers(init?.headers);
     if (isOpenRouterUrl(String(url))) {
       for (const [name, value] of Object.entries(OPENROUTER_ATTRIBUTION_HEADERS)) headers.set(name, value);
     }
+    for (const [name, value] of Object.entries(opencodeGatewayHeaders)) headers.set(name, value);
     if (route?.auth === "none") {
       headers.delete("authorization");
       headers.delete("x-api-key");
